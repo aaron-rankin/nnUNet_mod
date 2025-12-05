@@ -145,6 +145,7 @@ def run_training(dataset_name_or_id: Union[str, int],
                  only_run_validation: bool = False,
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
+                 num_epochs: Optional[int] = None,  # ADD THIS PARAMETER
                  device: torch.device = torch.device('cuda')):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -192,6 +193,12 @@ def run_training(dataset_name_or_id: Union[str, int],
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
                                                plans_identifier, device=device)
 
+        # ADD THESE LINES AFTER TRAINER CREATION
+        if num_epochs is not None:
+            nnunet_trainer.num_epochs = num_epochs
+            nnunet_trainer._num_epochs_explicitly_set = True  # Mark as explicitly set
+            print(f"Overriding num_epochs to {num_epochs}")
+
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
 
@@ -234,6 +241,8 @@ def run_training_entry():
                              'segmentations). Needed for finding the best ensemble.')
     parser.add_argument('--c', action='store_true', required=False,
                         help='[OPTIONAL] Continue training from latest checkpoint')
+    parser.add_argument('--num_epochs', type=int, default=None, required=False,
+                        help='[OPTIONAL] Number of epochs to train. Overrides the default value.')
     parser.add_argument('--val', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to only run the validation. Requires training to have finished.')
     parser.add_argument('--val_best', action='store_true', required=False,
@@ -265,6 +274,7 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
+                 num_epochs=args.num_epochs,  # ADD THIS ARGUMENT
                  device=device)
 
 

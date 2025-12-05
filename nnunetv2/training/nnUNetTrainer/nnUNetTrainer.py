@@ -148,7 +148,8 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 250 
+        self.num_epochs = 350                                     #! CHANGE AS NEEDED
+        self._num_epochs_explicitly_set = False  # Track if num_epochs was explicitly set
         self.current_epoch = 0
         self.enable_deep_supervision = True
         #*** End hyperparameters
@@ -1187,6 +1188,10 @@ class nnUNetTrainer(object):
                 key = key[7:]
             new_state_dict[key] = value
 
+        # Store the current num_epochs and flag before loading checkpoint
+        num_epochs_before_loading = self.num_epochs
+        was_explicitly_set = getattr(self, '_num_epochs_explicitly_set', False)
+        
         self.my_init_kwargs = checkpoint['init_args']
         self.current_epoch = checkpoint['current_epoch']
         self.logger.load_checkpoint(checkpoint['logging'])
@@ -1194,21 +1199,11 @@ class nnUNetTrainer(object):
         self.inference_allowed_mirroring_axes = checkpoint[
             'inference_allowed_mirroring_axes'] if 'inference_allowed_mirroring_axes' in checkpoint.keys() else self.inference_allowed_mirroring_axes
 
-        # messing with state dict naming schemes. Facepalm.
-        if self.is_ddp:
-            if isinstance(self.network.module, OptimizedModule):
-                self.network.module._orig_mod.load_state_dict(new_state_dict)
-            else:
-                self.network.module.load_state_dict(new_state_dict)
-        else:
-            if isinstance(self.network, OptimizedModule):
-                self.network._orig_mod.load_state_dict(new_state_dict)
-            else:
-                self.network.load_state_dict(new_state_dict)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        if self.grad_scaler is not None:
-            if checkpoint['grad_scaler_state'] is not None:
-                self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        # Restore num_epochs if it was explicitly set (e.g., via --num_epochs CLI argument)
+        if was_explicitly_set:
+            self.num_epochs = num_epochs_before_loading
+            self._num_epochs_explicitly_set = True
+            self.print_to_log_file(f"Overriding checkpoint's num_epochs with explicitly set value: {self.num_epochs}")
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
