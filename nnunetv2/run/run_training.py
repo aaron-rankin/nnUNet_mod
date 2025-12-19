@@ -108,11 +108,17 @@ def cleanup_ddp():
 
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size):
+            pretrained_weights, npz, val_with_best, num_epochs, world_size):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
     nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p)
+
+    # ADD THESE LINES
+    if num_epochs is not None:
+        nnunet_trainer.num_epochs = num_epochs
+        nnunet_trainer._num_epochs_explicitly_set = True
+        print(f"Rank {rank}: Overriding num_epochs to {num_epochs}")
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -186,6 +192,7 @@ def run_training(dataset_name_or_id: Union[str, int],
                      pretrained_weights,
                      export_validation_probabilities,
                      val_with_best,
+                     num_epochs,  # ADD THIS
                      num_gpus),
                  nprocs=num_gpus,
                  join=True)

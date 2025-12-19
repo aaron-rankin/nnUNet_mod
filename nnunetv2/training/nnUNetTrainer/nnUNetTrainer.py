@@ -191,13 +191,13 @@ class nnUNetTrainer(object):
 
         self.was_initialized = False
 
-        self.print_to_log_file("\n#######################################################################\n"
-                               "Please cite the following paper when using nnU-Net:\n"
-                               "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
-                               "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
-                               "Nature methods, 18(2), 203-211.\n"
-                               "#######################################################################\n",
-                               also_print_to_console=True, add_timestamp=False)
+        # self.print_to_log_file("\n#######################################################################\n"
+        #                        "Please cite the following paper when using nnU-Net:\n"
+        #                        "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
+        #                        "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
+        #                        "Nature methods, 18(2), 203-211.\n"
+        #                        "#######################################################################\n",
+        #                        also_print_to_console=False, add_timestamp=False)
 
     def initialize(self):
         if not self.was_initialized:
@@ -1132,6 +1132,9 @@ class nnUNetTrainer(object):
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
 
+        # Print progress
+        self.print_to_log_file(f"Epoch {self.current_epoch}/{self.num_epochs} completed")
+
         # handling periodic checkpointing
         current_epoch = self.current_epoch
         if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
@@ -1162,12 +1165,15 @@ class nnUNetTrainer(object):
                     'network_weights': mod.state_dict(),
                     'optimizer_state': self.optimizer.state_dict(),
                     'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    'lr_scheduler_state': self.lr_scheduler.state_dict() if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None else None,
                     'logging': self.logger.get_checkpoint(),
-                    '_best_ema': self._best_ema,
-                    'current_epoch': self.current_epoch + 1,
                     'init_args': self.my_init_kwargs,
-                    'trainer_name': self.__class__.__name__,
+                    'current_epoch': self.current_epoch,
+                    'num_epochs': self.num_epochs,
+                    '_best_ema': self._best_ema,
                     'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+                    'random_state': torch.get_rng_state(),
+                    'numpy_random_state': np.random.get_state(),
                 }
                 torch.save(checkpoint, filename)
             else:
@@ -1179,6 +1185,27 @@ class nnUNetTrainer(object):
 
         if isinstance(filename_or_checkpoint, str):
             checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
+        else:
+            checkpoint = filename_or_checkpoint
+    
+        # Store values before loading
+        num_epochs_before_loading = self.num_epochs
+        was_explicitly_set = getattr(self, '_num_epochs_explicitly_set', False)
+        
+        # Load checkpoint values
+        self.my_init_kwargs = checkpoint['init_args']
+        self.current_epoch = checkpoint['current_epoch']
+        self.logger.load_checkpoint(checkpoint['logging'])
+        self._best_ema = checkpoint['_best_ema']
+        self.inference_allowed_mirroring_axes = checkpoint.get('inference_allowed_mirroring_axes', 
+                                                               self.inference_allowed_mirroring_axes)
+        
+        # Handle num_epochs override BEFORE creating optimizer/scheduler
+        if was_explicitly_set:
+            self.num_epochs = num_epochs_before_loading
+            self._num_epochs_explicitly_set = True
+            self.print_to_log_file(f"Overriding checkpoint's num_epochs: {checkpoint.get('num_epochs', 'unknown')} -> {self.num_epochs}")
+        
         # if state dict comes from nn.DataParallel but we use non-parallel model here then the state dict keys do not
         # match. Use heuristic to make it match
         new_state_dict = {}
@@ -1188,22 +1215,59 @@ class nnUNetTrainer(object):
                 key = key[7:]
             new_state_dict[key] = value
 
-        # Store the current num_epochs and flag before loading checkpoint
-        num_epochs_before_loading = self.num_epochs
-        was_explicitly_set = getattr(self, '_num_epochs_explicitly_set', False)
+        # Load network weights
+        if self.is_ddp:
+            if isinstance(self.network.module, OptimizedModule):
+                self.network.module._orig_mod.load_state_dict(new_state_dict)
+            else:
+                self.network.module.load_state_dict(new_state_dict)
+        else:
+            if isinstance(self.network, OptimizedModule):
+                self.network._orig_mod.load_state_dict(new_state_dict)
+            else:
+                self.network.load_state_dict(new_state_dict)
         
-        self.my_init_kwargs = checkpoint['init_args']
-        self.current_epoch = checkpoint['current_epoch']
-        self.logger.load_checkpoint(checkpoint['logging'])
-        self._best_ema = checkpoint['_best_ema']
-        self.inference_allowed_mirroring_axes = checkpoint[
-            'inference_allowed_mirroring_axes'] if 'inference_allowed_mirroring_axes' in checkpoint.keys() else self.inference_allowed_mirroring_axes
-
-        # Restore num_epochs if it was explicitly set (e.g., via --num_epochs CLI argument)
-        if was_explicitly_set:
-            self.num_epochs = num_epochs_before_loading
-            self._num_epochs_explicitly_set = True
-            self.print_to_log_file(f"Overriding checkpoint's num_epochs with explicitly set value: {self.num_epochs}")
+        # Load optimizer state
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        
+        # Recreate LR scheduler with potentially new num_epochs
+        self.lr_scheduler = PolyLRScheduler(self.optimizer, self.initial_lr, self.num_epochs)
+        
+        # Restore scheduler to current epoch
+        if 'lr_scheduler_state' in checkpoint and checkpoint['lr_scheduler_state'] is not None:
+            try:
+                self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state'])
+            except:
+                # If loading fails (e.g., due to num_epochs change), manually step
+                self.print_to_log_file(f"Could not load LR scheduler state, manually stepping to epoch {self.current_epoch}")
+                for _ in range(self.current_epoch):
+                    self.lr_scheduler.step(self.current_epoch)
+        else:
+            # Manually step the scheduler to current epoch
+            for _ in range(self.current_epoch):
+                self.lr_scheduler.step(self.current_epoch)
+        
+        # Load grad scaler
+        if self.grad_scaler is not None:
+            if checkpoint.get('grad_scaler_state') is not None:
+                self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        
+        # Restore random states if available (for reproducibility)
+        if 'random_state' in checkpoint:
+            try:
+                torch.set_rng_state(checkpoint['random_state'])
+            except (TypeError, RuntimeError) as e:
+                self.print_to_log_file(f"WARNING: Could not restore torch RNG state due to incompatibility: {e}")
+                self.print_to_log_file("This may happen when loading checkpoints from different PyTorch versions.")
+        if 'numpy_random_state' in checkpoint:
+            try:
+                np.random.set_state(checkpoint['numpy_random_state'])
+            except (TypeError, ValueError) as e:
+                self.print_to_log_file(f"WARNING: Could not restore numpy RNG state due to incompatibility: {e}")
+        
+        # Print diagnostics
+        current_lr = self.optimizer.param_groups[0]['lr']
+        self.print_to_log_file(f"Resuming from epoch {self.current_epoch}/{self.num_epochs} with LR={current_lr:.6e}")
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
