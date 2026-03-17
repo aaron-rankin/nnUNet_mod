@@ -1,3 +1,6 @@
+import os
+from typing import Optional
+
 import matplotlib
 from batchgenerators.utilities.file_and_folder_operations import join
 
@@ -14,7 +17,7 @@ class nnUNetLogger(object):
 
     YOU MUST LOG EXACTLY ONE VALUE PER EPOCH FOR EACH OF THE LOGGING ITEMS! DONT FUCK IT UP
     """
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, context: Optional[dict] = None):
         self.my_fantastic_logging = {
             'mean_fg_dice': list(),
             'ema_fg_dice': list(),
@@ -26,7 +29,53 @@ class nnUNetLogger(object):
             'epoch_end_timestamps': list()
         }
         self.verbose = verbose
+        self.context = context or {}
+        self._wandb = None
+        self._wandb_run = None
+        self._wandb_enabled = str(os.environ.get('NNUNET_WANDB_ENABLED', '0')).lower() in ('1', 'true', 'yes', 'on')
         # shut up, this logging is great
+
+    def _ensure_wandb_run(self):
+        if not self._wandb_enabled or self._wandb_run is not None:
+            return
+        if self.context.get('local_rank', 0) != 0:
+            return
+
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            print('W&B requested but the wandb package is not installed. Continuing without W&B logging.')
+            self._wandb_enabled = False
+            return
+
+        init_kwargs = {
+            'project': os.environ.get('NNUNET_WANDB_PROJECT', 'nnunet-holiday-runs'),
+            'entity': os.environ.get('NNUNET_WANDB_ENTITY') or None,
+            'name': os.environ.get('NNUNET_WANDB_RUN_NAME') or self.context.get('run_name'),
+            'tags': [tag.strip() for tag in os.environ.get('NNUNET_WANDB_TAGS', '').split(',') if tag.strip()],
+            'config': self.context,
+        }
+
+        run_id = os.environ.get('NNUNET_WANDB_RUN_ID')
+        if run_id:
+            init_kwargs['id'] = run_id
+            init_kwargs['resume'] = os.environ.get('NNUNET_WANDB_RESUME', 'allow')
+
+        self._wandb = wandb
+        self._wandb_run = wandb.init(**init_kwargs)
+
+    def _wandb_log(self, key, value, epoch: int):
+        self._ensure_wandb_run()
+        if self._wandb_run is None:
+            return
+
+        payload = {'epoch': epoch}
+        if isinstance(value, (list, tuple)):
+            for idx, item in enumerate(value):
+                payload[f'{key}/{idx}'] = item
+        else:
+            payload[key] = value
+        self._wandb_run.log(payload, step=epoch)
 
     def log(self, key, value, epoch: int):
         """
@@ -44,6 +93,8 @@ class nnUNetLogger(object):
                                                                        'lists length is off by more than 1'
             print(f'maybe some logging issue!? logging {key} and {value}')
             self.my_fantastic_logging[key][epoch] = value
+
+        self._wandb_log(key, value, epoch)
 
         # handle the ema_fg_dice special case! It is automatically logged when we add a new mean_fg_dice
         if key == 'mean_fg_dice':
@@ -101,3 +152,8 @@ class nnUNetLogger(object):
 
     def load_checkpoint(self, checkpoint: dict):
         self.my_fantastic_logging = checkpoint
+
+    def finish(self):
+        if self._wandb_run is not None:
+            self._wandb_run.finish()
+            self._wandb_run = None

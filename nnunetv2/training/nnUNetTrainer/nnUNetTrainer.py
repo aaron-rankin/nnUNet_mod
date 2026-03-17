@@ -1,6 +1,7 @@
 import inspect
 import multiprocessing
 import os
+import signal
 import shutil
 import sys
 import warnings
@@ -65,6 +66,10 @@ from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+
+
+class GracefulTrainingStop(RuntimeError):
+    pass
 
 
 class nnUNetTrainer(object):
@@ -146,7 +151,7 @@ class nnUNetTrainer(object):
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
-        self.num_iterations_per_epoch = 250
+        self.num_iterations_per_epoch = 200
         self.num_val_iterations_per_epoch = 50
         self.num_epochs = 500                                     #! CHANGE AS NEEDED
         self._num_epochs_explicitly_set = False  # Track if num_epochs was explicitly set
@@ -173,7 +178,16 @@ class nnUNetTrainer(object):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
+        self.logger = nnUNetLogger(context={
+            'dataset_name': self.plans_manager.dataset_name,
+            'configuration': self.configuration_name,
+            'fold': self.fold,
+            'trainer': self.__class__.__name__,
+            'plans': self.plans_manager.plans_name,
+            'output_folder': self.output_folder,
+            'local_rank': self.local_rank,
+            'run_name': f"{self.plans_manager.dataset_name}-{self.configuration_name}-fold{self.fold}-{self.__class__.__name__}",
+        })
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -186,10 +200,20 @@ class nnUNetTrainer(object):
         # self.configure_rotation_dummyDA_mirroring_and_inital_patch_size and will be saved in checkpoints
 
         ### checkpoint saving stuff
-        self.save_every = 25
+        save_every_env = os.environ.get('NNUNET_SAVE_EVERY', '25')
+        try:
+            self.save_every = max(1, int(save_every_env))
+        except ValueError:
+            print(f"Invalid NNUNET_SAVE_EVERY={save_every_env!r}. Falling back to 25.")
+            self.save_every = 25
         self.disable_checkpointing = False
+        self._termination_requested = False
+        self._termination_signal = None
+        self._previous_signal_handlers = {}
 
         self.was_initialized = False
+
+        self._register_signal_handlers()
 
         # self.print_to_log_file("\n#######################################################################\n"
         #                        "Please cite the following paper when using nnU-Net:\n"
@@ -228,7 +252,6 @@ class nnUNetTrainer(object):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
             self.loss = self._build_loss()
-
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
             # torch 2.2.2 crashes upon compiling CE loss
@@ -238,6 +261,56 @@ class nnUNetTrainer(object):
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
+
+    def _register_signal_handlers(self):
+        # Only register on rank 0. In DDP every worker has its own trainer instance;
+        # registering on all ranks would trigger concurrent unsynchronised checkpoint
+        # writes when a signal reaches the whole process group.
+        if self.local_rank != 0:
+            return
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                self._previous_signal_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._handle_termination_signal)
+            except (ValueError, AttributeError):
+                continue
+
+    def _restore_signal_handlers(self):
+        for sig, previous_handler in self._previous_signal_handlers.items():
+            try:
+                signal.signal(sig, previous_handler)
+            except (ValueError, AttributeError):
+                continue
+        self._previous_signal_handlers = {}
+
+    def _handle_termination_signal(self, signum, frame):
+        self._termination_requested = True
+        self._termination_signal = signum
+        self.print_to_log_file(
+            f"Received signal {signum}. Will save checkpoint_latest at the next safe interruption point.")
+
+    def _shutdown_dataloaders(self):
+        old_stdout = sys.stdout
+        with open(os.devnull, 'w') as f:
+            sys.stdout = f
+            if self.dataloader_train is not None and \
+                    isinstance(self.dataloader_train, (NonDetMultiThreadedAugmenter, MultiThreadedAugmenter)):
+                self.dataloader_train._finish()
+            if self.dataloader_val is not None and \
+                    isinstance(self.dataloader_val, (NonDetMultiThreadedAugmenter, MultiThreadedAugmenter)):
+                self.dataloader_val._finish()
+            sys.stdout = old_stdout
+
+    def _stop_if_requested(self):
+        if not self._termination_requested:
+            return
+
+        self.print_to_log_file('Termination requested. Writing checkpoint_latest and stopping training.')
+        self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
+        self._shutdown_dataloaders()
+        empty_cache(self.device)
+        self.logger.finish()
+        raise GracefulTrainingStop(f'Stopped after signal {self._termination_signal}')
 
     def _do_i_compile(self):
         # new default: compile is enabled!
@@ -948,18 +1021,10 @@ class nnUNetTrainer(object):
             os.remove(join(self.output_folder, "checkpoint_latest.pth"))
 
         # shut down dataloaders
-        old_stdout = sys.stdout
-        with open(os.devnull, 'w') as f:
-            sys.stdout = f
-            if self.dataloader_train is not None and \
-                    isinstance(self.dataloader_train, (NonDetMultiThreadedAugmenter, MultiThreadedAugmenter)):
-                self.dataloader_train._finish()
-            if self.dataloader_val is not None and \
-                    isinstance(self.dataloader_train, (NonDetMultiThreadedAugmenter, MultiThreadedAugmenter)):
-                self.dataloader_val._finish()
-            sys.stdout = old_stdout
+        self._shutdown_dataloaders()
 
         empty_cache(self.device)
+        self.logger.finish()
         self.print_to_log_file("Training done.")
 
     def on_train_epoch_start(self):
@@ -1422,22 +1487,35 @@ class nnUNetTrainer(object):
     def run_training(self):
         self.on_train_start()
 
-        for epoch in range(self.current_epoch, self.num_epochs):
-            self.on_epoch_start()
+        try:
+            for epoch in range(self.current_epoch, self.num_epochs):
+                self._stop_if_requested()
+                self.on_epoch_start()
 
-            self.on_train_epoch_start()
-            train_outputs = []
-            for batch_id in range(self.num_iterations_per_epoch):
-                train_outputs.append(self.train_step(next(self.dataloader_train)))
-            self.on_train_epoch_end(train_outputs)
+                self.on_train_epoch_start()
+                train_outputs = []
+                for batch_id in range(self.num_iterations_per_epoch):
+                    self._stop_if_requested()
+                    train_outputs.append(self.train_step(next(self.dataloader_train)))
+                self.on_train_epoch_end(train_outputs)
 
-            with torch.no_grad():
-                self.on_validation_epoch_start()
-                val_outputs = []
-                for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
-                self.on_validation_epoch_end(val_outputs)
+                with torch.no_grad():
+                    self._stop_if_requested()
+                    self.on_validation_epoch_start()
+                    val_outputs = []
+                    for batch_id in range(self.num_val_iterations_per_epoch):
+                        self._stop_if_requested()
+                        val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                    self.on_validation_epoch_end(val_outputs)
 
-            self.on_epoch_end()
+                self.on_epoch_end()
 
-        self.on_train_end()
+            self.on_train_end()
+        except GracefulTrainingStop:
+            self._termination_requested = False  # reset so any later caller (e.g. validation) doesn't immediately bail
+            self.print_to_log_file('Training stopped gracefully. Resume later with --c.')
+            # NOTE: on_train_end() is intentionally NOT called here. That hook removes checkpoint_latest
+            # and performs final book-keeping that is only appropriate when training truly finished.
+            # _stop_if_requested() has already saved the checkpoint and called logger.finish().
+        finally:
+            self._restore_signal_handlers()

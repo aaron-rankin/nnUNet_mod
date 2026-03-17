@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import socket
+import sys
 from typing import Union, Optional
 
 import nnunetv2
@@ -219,6 +220,10 @@ def run_training(dataset_name_or_id: Union[str, int],
 
         if not only_run_validation:
             nnunet_trainer.run_training()
+            if getattr(nnunet_trainer, '_termination_requested', False):
+                print("Training was interrupted by a signal. Checkpoint saved. "
+                      "Re-run with --c to resume. Skipping post-training validation.")
+                return 1
 
         if val_with_best:
             nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
@@ -279,10 +284,12 @@ def run_training_entry():
     else:
         device = torch.device('mps')
 
-    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
+    rc = run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
                  num_epochs=args.num_epochs,  # ADD THIS ARGUMENT
                  device=device)
+    if rc:
+        sys.exit(rc)
 
 
 if __name__ == '__main__':
