@@ -148,7 +148,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 350                                     #! CHANGE AS NEEDED
+        self.num_epochs = 500                                     #! CHANGE AS NEEDED
         self._num_epochs_explicitly_set = False  # Track if num_epochs was explicitly set
         self.current_epoch = 0
         self.enable_deep_supervision = True
