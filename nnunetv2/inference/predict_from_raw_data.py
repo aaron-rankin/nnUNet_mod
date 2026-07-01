@@ -86,7 +86,7 @@ class nnUNetPredictor(object):
             checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
                                     map_location=torch.device('cpu'), weights_only=False)
             if i == 0:
-                trainer_name = checkpoint['trainer_name']
+                trainer_name = checkpoint.get('trainer_name', 'nnUNetTrainer')
                 configuration_name = checkpoint['init_args']['configuration']
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None

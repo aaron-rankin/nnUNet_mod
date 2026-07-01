@@ -89,3 +89,49 @@ class nnUNetTrainerBoundaryCEHighWeight(nnUNetTrainerBoundaryCE):
     """
     
     BOUNDARY_WEIGHT = 5.0
+
+
+class nnUNetTrainerBoundaryCE_Weight1(nnUNetTrainerBoundaryCE):
+    """
+    Trainer using DC + BoundaryCE loss with boundary_weight=1.0.
+    
+    Tests whether a milder boundary weight (1.0 vs default 3.0) provides
+    better balance between boundary and interior voxel learning.
+    """
+    
+    BOUNDARY_WEIGHT = 1.0
+
+
+class nnUNetTrainerBoundaryCE_LargerRadius(nnUNetTrainerBoundaryCE):
+    """
+    Trainer using DC + BoundaryCE loss with boundary_radius=5.
+    
+    Tests whether a thicker boundary shell (5 voxels vs default 3)
+    captures more context around muscle boundaries.
+    """
+    
+    BOUNDARY_RADIUS = 5
+
+
+class nnUNetTrainerBoundaryCE_Weight1_Radius5(nnUNetTrainerBoundaryCE):
+    """
+    Trainer using DC + BoundaryCE loss with boundary_weight=1.0 and boundary_radius=5.
+    
+    Tests the combination of mild boundary weighting (1.0) with expanded
+    boundary region (5 voxels) for BF-SH segmentation.
+    """
+    
+    BOUNDARY_RADIUS = 5
+    BOUNDARY_WEIGHT = 1.0
+
+
+class nnUNetTrainerBoundaryCEHighWeight_Radius5(nnUNetTrainerBoundaryCE):
+    """
+    Trainer using DC + BoundaryCE loss with boundary_weight=5.0 and boundary_radius=5.
+    
+    Tests aggressive boundary weighting (5.0) combined with expanded
+    boundary region (5 voxels) for challenging boundary cases.
+    """
+    
+    BOUNDARY_RADIUS = 5
+    BOUNDARY_WEIGHT = 5.0

@@ -907,3 +907,19 @@ class nnUNetTrainerDA5_10epochs(nnUNetTrainerDA5):
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 10
+
+
+class nnUNetTrainerDA5_NoZFlip(nnUNetTrainerDA5):
+    """
+    DA5 augmentation without z-axis (superior-inferior) mirroring.
+    Use when flipping along the z-axis is anatomically invalid (e.g. MSK, spine, brain with clear superior/inferior).
+    """
+    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
+        rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes = \
+            super().configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        patch_size = self.configuration_manager.patch_size
+        dim = len(patch_size)
+        if dim == 3:
+            mirror_axes = (1, 2)
+        self.inference_allowed_mirroring_axes = mirror_axes
+        return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes

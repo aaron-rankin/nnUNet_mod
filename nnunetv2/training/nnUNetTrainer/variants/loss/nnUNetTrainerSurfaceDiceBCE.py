@@ -22,6 +22,8 @@ class nnUNetTrainerSurfaceDiceBCE(nnUNetTrainer):
     """
     
     BOUNDARY_RADIUS = 3
+    WEIGHT_DICE = 1  # Weight for SurfaceDice loss
+    WEIGHT_CE = 1    # Weight for Cross-Entropy loss
     
     def _build_loss(self):
         """
@@ -58,8 +60,8 @@ class nnUNetTrainerSurfaceDiceBCE(nnUNetTrainer):
             loss = DC_and_SurfaceDice_BCE_loss(
                 soft_dice_kwargs,
                 ce_kwargs,
-                weight_ce=1,
-                weight_dice=1,
+                weight_ce=self.WEIGHT_CE,
+                weight_dice=self.WEIGHT_DICE,
                 ignore_label=self.label_manager.ignore_label
             )
         
@@ -89,3 +91,75 @@ class nnUNetTrainerSurfaceDiceBCE_LargerRadius(nnUNetTrainerSurfaceDiceBCE):
     """
     
     BOUNDARY_RADIUS = 5
+
+
+class nnUNetTrainerSurfaceDice_Weight3(nnUNetTrainerSurfaceDiceBCE):
+    """
+    SurfaceDice + BCE with Dice weight = 3.0, CE weight = 1.0.
+    
+    This tests whether increasing the SurfaceDice gradient signal (3x vs 1x)
+    improves boundary segmentation, particularly for BF-SH.
+    
+    Total loss = 3.0 * SurfaceDice + 1.0 * CE
+    Boundary radius = 3 (default)
+    """
+    
+    WEIGHT_DICE = 3.0
+    WEIGHT_CE = 1.0
+
+
+class nnUNetTrainerSurfaceDice_Weight5(nnUNetTrainerSurfaceDiceBCE):
+    """
+    SurfaceDice + BCE with Dice weight = 5.0, CE weight = 1.0.
+    
+    Tests a more aggressive weighting where SurfaceDice dominates (5x vs 1x).
+    May improve boundary precision but risks overfitting to boundary voxels.
+    
+    Total loss = 5.0 * SurfaceDice + 1.0 * CE
+    Boundary radius = 3 (default)
+    """
+    
+    WEIGHT_DICE = 5.0
+    WEIGHT_CE = 1.0
+
+
+class nnUNetTrainerSurfaceDice_W3_Radius5(nnUNetTrainerSurfaceDice_Weight3):
+    """
+    SurfaceDice + BCE with Dice weight = 3.0 and boundary radius = 5.
+    
+    Tests whether combining higher Dice weight (3x) with expanded boundary
+    region (5 voxels) improves BF-SH boundary segmentation.
+    
+    Total loss = 3.0 * SurfaceDice + 1.0 * CE
+    Boundary radius = 5
+    """
+    
+    BOUNDARY_RADIUS = 5
+
+
+class nnUNetTrainerSurfaceDice_W5_Radius5(nnUNetTrainerSurfaceDice_Weight5):
+    """
+    SurfaceDice + BCE with Dice weight = 5.0 and boundary radius = 5.
+
+    Tests aggressive Dice weighting (5x) combined with expanded boundary
+    region (5 voxels) for maximum boundary focus on challenging cases.
+
+    Total loss = 5.0 * SurfaceDice + 1.0 * CE
+    Boundary radius = 5
+    """
+
+    BOUNDARY_RADIUS = 5
+
+
+class nnUNetTrainerSurfaceDice_W5_Radius5_FixCheck(nnUNetTrainerSurfaceDice_W5_Radius5):
+    """
+    Short (50-epoch) run of W5_R5 used only to confirm the ignore-label fix in
+    boundary_losses.py: with sparse (every-other-slice) annotation the previous
+    loss produced "comb" predictions (blank odd slices). This should now fill the
+    full volume. Writes to its own results dir so the original combed run is kept.
+    """
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 50

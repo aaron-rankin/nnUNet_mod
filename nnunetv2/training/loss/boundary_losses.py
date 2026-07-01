@@ -232,24 +232,40 @@ class SurfaceDiceLoss(nn.Module):
         if seg_onehot is None:
             num_classes = net_output.shape[1]
             target_flat = target.squeeze(1) if target.dim() == 5 else target
-            
+            if target_flat.ndim < net_output.ndim:
+                target_flat = target_flat.view((target_flat.shape[0], 1, *target_flat.shape[1:]))
+
             # Handle ignore label BEFORE one-hot encoding
             if loss_mask is not None:
-                mask_squeezed = loss_mask.squeeze(1)
-                target_flat_safe = torch.where(mask_squeezed, target_flat, torch.zeros_like(target_flat))
+                target_flat_safe = torch.where(loss_mask.bool(), target_flat, torch.zeros_like(target_flat))
             else:
                 target_flat_safe = target_flat
-            
-            seg_onehot = F.one_hot(target_flat_safe.long(), num_classes=num_classes + 1)
-            seg_onehot = seg_onehot[..., 1:].permute(0, 4, 1, 2, 3).float()
+
+            # Use scatter_ into a (B, C, ...) bool tensor — same approach as MemoryEfficientSoftDiceLoss.
+            # This avoids the double-strip bug that arises from F.one_hot with num_classes+1.
+            seg_onehot = torch.zeros(
+                (target_flat_safe.shape[0], num_classes, *target_flat_safe.shape[2:]),
+                device=net_output.device, dtype=torch.float32
+            )
+            seg_onehot.scatter_(1, target_flat_safe.long(), 1)
+
             if not self.do_bg:
-                seg_onehot = seg_onehot[:, 1:]  # Remove background class
+                seg_onehot = seg_onehot[:, 1:]  # Remove background class (channel 0) — only once
         elif not self.do_bg and seg_onehot.shape[1] > 1:
             seg_onehot = seg_onehot[:, 1:]  # Remove background class
         
         # Compute boundary mask
         boundary = _morphological_boundary_mask(seg_onehot, self.boundary_radius)
-        
+
+        # Honour the ignore label: zero the boundary region on ignored voxels so they
+        # contribute nothing to tp/fp/fn below. Without this, ignored voxels are treated
+        # as background (target_flat_safe set them to 0 above) and any foreground predicted
+        # there is penalised as a false positive — which, with sparse (every-other-slice)
+        # annotation, trains the network to blank the un-annotated slices ("comb" output).
+        # loss_mask is (B, 1, *spatial) and broadcasts over the class dimension.
+        if loss_mask is not None:
+            boundary = boundary * loss_mask.to(boundary.dtype)
+
         # Apply nonlinearity (softmax)
         if self.apply_nonlin is not None:
             net_output = self.apply_nonlin(net_output)
@@ -356,12 +372,10 @@ class DC_and_SurfaceDice_BCE_loss(nn.Module):
         # Compute normal CE loss
         ce_loss: torch.Tensor = torch.tensor(0.0, device=net_output.device, dtype=net_output.dtype)
         if self.weight_ce != 0 and (self.ignore_label is None or (num_fg is not None and num_fg > 0)):
-            if self.ignore_label is not None and mask is not None:
-                target_for_ce = target.clone()
-                target_for_ce[~mask] = 0
-                ce_target = target_for_ce.squeeze(1).long()
-            else:
-                ce_target = target.squeeze(1).long()
+            # Keep ignored voxels at the ignore label so RobustCrossEntropyLoss(ignore_index)
+            # drops them. Previously they were relabelled to background (0), which defeated
+            # ignore_index and penalised the (un-annotated) ignored slices as background.
+            ce_target = target.squeeze(1).long()
             ce_loss = self.ce(net_output, ce_target)
         
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
