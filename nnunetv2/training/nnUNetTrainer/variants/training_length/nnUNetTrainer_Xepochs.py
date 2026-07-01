@@ -93,7 +93,7 @@ class nnUNetTrainer_2000epochs(nnUNetTrainer):
         self.num_epochs = 2000
         self._num_epochs_explicitly_set = True
 
-    
+
 class nnUNetTrainer_4000epochs(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):

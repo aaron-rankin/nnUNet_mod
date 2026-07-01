@@ -4,7 +4,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 
 class nnUNetTrainer_250epochs_NoMirroring(nnUNetTrainer):
-    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, 
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 250
@@ -19,7 +19,7 @@ class nnUNetTrainer_250epochs_NoMirroring(nnUNetTrainer):
 
 
 class nnUNetTrainer_2000epochs_NoMirroring(nnUNetTrainer):
-    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, 
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 2000
@@ -32,9 +32,9 @@ class nnUNetTrainer_2000epochs_NoMirroring(nnUNetTrainer):
         self.inference_allowed_mirroring_axes = None
         return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
 
-    
+
 class nnUNetTrainer_4000epochs_NoMirroring(nnUNetTrainer):
-    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, 
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 4000
@@ -49,7 +49,7 @@ class nnUNetTrainer_4000epochs_NoMirroring(nnUNetTrainer):
 
 
 class nnUNetTrainer_8000epochs_NoMirroring(nnUNetTrainer):
-    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, 
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 8000
@@ -61,4 +61,3 @@ class nnUNetTrainer_8000epochs_NoMirroring(nnUNetTrainer):
         mirror_axes = None
         self.inference_allowed_mirroring_axes = None
         return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
-
