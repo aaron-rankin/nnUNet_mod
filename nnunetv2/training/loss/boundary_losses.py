@@ -7,22 +7,58 @@ from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 
 
-def _morphological_boundary_mask(seg_onehot: torch.Tensor, radius: int = 3) -> torch.Tensor:
+def _foreground_onehot(target_bc1: torch.Tensor, num_classes: int,
+                       ref: torch.Tensor) -> torch.Tensor:
+    """One-hot the foreground classes 1..num_classes of a (B, 1, *spatial) label map.
+
+    Uses `scatter_` rather than `F.one_hot(...).permute(0, 4, 1, 2, 3)`, which hardcodes a
+    5D layout and therefore cannot handle 2D configurations. Ignore voxels must already be
+    mapped to 0 by the caller.
     """
-    GPU morphological boundary shell.
-    
+    oh = torch.zeros(
+        (target_bc1.shape[0], num_classes + 1, *target_bc1.shape[2:]),
+        device=ref.device, dtype=torch.float32,
+    )
+    oh.scatter_(1, target_bc1.long(), 1)
+    return oh[:, 1:]  # drop background -> channels correspond to labels 1..num_classes
+
+
+def _morphological_boundary_mask(seg_onehot: torch.Tensor, radius: int = 3,
+                                 inplane_only: bool = False) -> torch.Tensor:
+    """
+    GPU morphological boundary shell (dilation minus erosion).
+
     Args:
-        seg_onehot: (B, C, X, Y, Z), float in [0, 1]
+        seg_onehot: (B, C, H, W) for 2D, or (B, C, Z, Y, X) for 3D; float in [0, 1]
         radius: morphological shell radius in voxels
-        
+        inplane_only: restrict the structuring element to the in-plane axes (3D only)
+
     Returns:
         Binary mask of same shape: 1 inside boundary shell, 0 elsewhere
+
+    `inplane_only` exists because this dataset annotates only even z-slices; odd slices carry
+    the ignore label and every loss maps ignore -> background before one-hot. A 3D erosion with
+    any z-radius >= 1 therefore annihilates *every* foreground voxel (eroded is identically
+    zero), so the "shell" becomes the entire structure and the loss silently degenerates:
+    BoundaryCE to foreground-weighted CE, SurfaceDice to plain Dice. Restricting the structuring
+    element to (1, k, k) keeps erosion well-defined. It is also the physically sensible choice
+    here: at [4.0, 0.406, 0.406] mm spacing an isotropic voxel radius of 5 spans 20 mm
+    through-plane against 2 mm in-plane.
     """
     k = 2 * radius + 1
+    if seg_onehot.ndim == 4:
+        pool, kern, pad = F.max_pool2d, k, radius
+    elif seg_onehot.ndim == 5:
+        pool = F.max_pool3d
+        kern, pad = ((1, k, k), (0, radius, radius)) if inplane_only else (k, radius)
+    else:
+        raise ValueError(
+            f"seg_onehot must be 4D (B,C,H,W) or 5D (B,C,Z,Y,X), got {seg_onehot.ndim}D"
+        )
     # Dilate: max pooling (foreground expands)
-    dilated = F.max_pool3d(seg_onehot, kernel_size=k, stride=1, padding=radius)
+    dilated = pool(seg_onehot, kernel_size=kern, stride=1, padding=pad)
     # Erode: min pooling = -max_pool(-x) (foreground shrinks)
-    eroded = -F.max_pool3d(-seg_onehot, kernel_size=k, stride=1, padding=radius)
+    eroded = -pool(-seg_onehot, kernel_size=kern, stride=1, padding=pad)
     # Boundary = dilated - eroded
     boundary = (dilated - eroded).clamp(0, 1)
     return boundary
@@ -40,75 +76,56 @@ class BoundaryCELoss(nn.Module):
         ignore_index: label value to exclude from loss (default -100)
     """
     
-    def __init__(self, boundary_radius: int = 3, boundary_weight: float = 3.0, 
-                 ignore_index: int = -100):
+    def __init__(self, boundary_radius: int = 3, boundary_weight: float = 3.0,
+                 ignore_index: int = -100, inplane_only: bool = False):
         super().__init__()
         self.boundary_radius = boundary_radius
         self.boundary_weight = boundary_weight
         self.ignore_index = ignore_index
+        self.inplane_only = inplane_only
         self.ce = RobustCrossEntropyLoss(reduction='none', ignore_index=ignore_index)
-    
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor, 
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor,
                 seg_onehot: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            net_output: (B, C, X, Y, Z) - network outputs (logits)
-            target: (B, 1, X, Y, Z) or (B, X, Y, Z) - class indices
-            seg_onehot: (B, C, X, Y, Z) - one-hot encoded target (optional, for efficiency)
-            
+            net_output: (B, C, *spatial) - network outputs (logits), 2D or 3D
+            target: (B, 1, *spatial) or (B, *spatial) - class indices
+            seg_onehot: (B, C, *spatial) - one-hot encoded target (optional, for efficiency)
+
         Returns:
             Weighted cross-entropy loss
         """
-        # Convert target to one-hot if not provided
-        if seg_onehot is None:
-            num_classes = net_output.shape[1]
-            # target should be (B, X, Y, Z) or (B, 1, X, Y, Z)
-            target_flat = target.squeeze(1) if target.dim() == 5 else target
-            
-            # Handle ignore label BEFORE one-hot encoding (replace with 0 temporarily)
-            if self.ignore_index is not None:
-                target_flat_safe = torch.where(target_flat == self.ignore_index, 0, target_flat)
-            else:
-                target_flat_safe = target_flat
-            
-            seg_onehot = F.one_hot(target_flat_safe.long(), num_classes=num_classes + 1)
-            seg_onehot = seg_onehot[..., 1:].permute(0, 4, 1, 2, 3).float()  # Remove background
-        
-        # Compute boundary mask
-        boundary = _morphological_boundary_mask(seg_onehot, self.boundary_radius)
-        
-        # Compute weights: 1.0 base + (boundary_weight - 1.0) on boundaries
-        # We average across classes to get per-voxel weight
-        per_voxel_boundary = boundary.max(dim=1, keepdim=True)[0]  # (B, 1, X, Y, Z)
-        weights = 1.0 + (self.boundary_weight - 1.0) * per_voxel_boundary
-        
-        # Handle ignore label
+        # Normalise target to (B, 1, *spatial) so 2D and 3D share one code path.
+        if target.ndim == net_output.ndim - 1:
+            target = target.unsqueeze(1)
+
+        # Handle ignore label BEFORE one-hot encoding (replace with 0 temporarily)
         if self.ignore_index is not None:
             mask = target != self.ignore_index
-            target_ce = torch.where(mask, target, 0)
-            num_fg = mask.sum()
+            target_safe = torch.where(mask, target, 0)
         else:
-            target_ce = target
             mask = None
-            num_fg = None
-        
-        # Compute per-voxel CE
-        # target_ce should be (B, X, Y, Z) for CE
-        if target_ce.dim() == 5:
-            target_ce = target_ce.squeeze(1)
-        ce_loss = self.ce(net_output, target_ce.long())  # (B, X, Y, Z)
-        
-        # Apply weights and reduce
-        if self.ignore_index is not None and num_fg is not None and mask is not None:
-            # mask is (B, 1, X, Y, Z), weights is (B, 1, X, Y, Z)
-            mask_for_compute = mask.squeeze(1) if mask.dim() == 5 else mask
-            weights_for_compute = weights.squeeze(1)
-            weighted_loss = (ce_loss * weights_for_compute * mask_for_compute).sum() / torch.clip(mask_for_compute.sum(), min=1e-8)
-        else:
-            weights_for_compute = weights.squeeze(1)
-            weighted_loss = (ce_loss * weights_for_compute).mean()
-        
-        return weighted_loss
+            target_safe = target
+
+        if seg_onehot is None:
+            seg_onehot = _foreground_onehot(target_safe, net_output.shape[1], net_output)
+
+        boundary = _morphological_boundary_mask(
+            seg_onehot, self.boundary_radius, self.inplane_only
+        )
+
+        # Compute weights: 1.0 base + (boundary_weight - 1.0) on boundaries.
+        # Collapse across classes to get a per-voxel weight.
+        per_voxel_boundary = boundary.max(dim=1, keepdim=True)[0]  # (B, 1, *spatial)
+        weights = (1.0 + (self.boundary_weight - 1.0) * per_voxel_boundary)[:, 0]
+
+        ce_loss = self.ce(net_output, target_safe[:, 0].long())  # (B, *spatial)
+
+        if mask is not None:
+            m = mask[:, 0].to(ce_loss.dtype)
+            return (ce_loss * weights * m).sum() / torch.clip(m.sum(), min=1e-8)
+        return (ce_loss * weights).mean()
 
 
 class DC_and_BoundaryCE_loss(nn.Module):
@@ -139,21 +156,23 @@ class DC_and_BoundaryCE_loss(nn.Module):
         # Extract boundary-specific kwargs
         boundary_radius = ce_kwargs.get('boundary_radius', 3)
         boundary_weight = ce_kwargs.get('boundary_weight', 3.0)
-        
+        inplane_only = ce_kwargs.get('inplane_only', False)
+
         self.ce = BoundaryCELoss(
             boundary_radius=boundary_radius,
             boundary_weight=boundary_weight,
-            ignore_index=ignore_label if ignore_label is not None else -100
+            ignore_index=ignore_label if ignore_label is not None else -100,
+            inplane_only=inplane_only,
         )
-        
+
         self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
-    
+
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            net_output: (B, C, X, Y, Z) - logits
-            target: (B, 1, X, Y, Z) - class indices
-            
+            net_output: (B, C, *spatial) - logits, 2D or 3D
+            target: (B, 1, *spatial) - class indices
+
         Returns:
             Combined loss
         """
@@ -167,29 +186,17 @@ class DC_and_BoundaryCE_loss(nn.Module):
             target_dice = target
             mask = None
             num_fg = None
-        
+
         # Compute Dice loss
         dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \
             if self.weight_dice != 0 else 0
-        
-        # For CE, we need one-hot
-        seg_onehot = None
+
+        # BoundaryCELoss builds its own one-hot; it is dimension-agnostic.
         if self.weight_ce != 0 and (self.ignore_label is None or (num_fg is not None and num_fg > 0)):
-            num_classes = net_output.shape[1]
-            target_flat = target.squeeze(1) if target.dim() == 5 else target
-            
-            # Handle ignore label BEFORE one-hot encoding (replace with 0 temporarily)
-            if self.ignore_label is not None:
-                target_flat_safe = torch.where(target_flat == self.ignore_label, 0, target_flat)
-            else:
-                target_flat_safe = target_flat
-            
-            seg_onehot = F.one_hot(target_flat_safe.long(), num_classes=num_classes + 1)
-            seg_onehot = seg_onehot[..., 1:].permute(0, 4, 1, 2, 3).float()
-        
-        ce_loss_val: torch.Tensor = self.ce(net_output, target, seg_onehot=seg_onehot) \
-            if self.weight_ce != 0 and (self.ignore_label is None or (num_fg is not None and num_fg > 0)) else torch.tensor(0.0, device=net_output.device, dtype=net_output.dtype)
-        
+            ce_loss_val = self.ce(net_output, target)
+        else:
+            ce_loss_val = torch.tensor(0.0, device=net_output.device, dtype=net_output.dtype)
+
         result: torch.Tensor = self.weight_ce * ce_loss_val + self.weight_dice * dc_loss
         return result
 
@@ -206,15 +213,16 @@ class SurfaceDiceLoss(nn.Module):
         apply_nonlin: softmax or sigmoid function to apply to net_output
     """
     
-    def __init__(self, boundary_radius: int = 3, smooth: float = 1e-5, 
-                 batch_dice: bool = True, do_bg: bool = False, 
-                 apply_nonlin=None):
+    def __init__(self, boundary_radius: int = 3, smooth: float = 1e-5,
+                 batch_dice: bool = True, do_bg: bool = False,
+                 apply_nonlin=None, inplane_only: bool = False):
         super().__init__()
         self.boundary_radius = boundary_radius
         self.smooth = smooth
         self.batch_dice = batch_dice
         self.do_bg = do_bg
         self.apply_nonlin = apply_nonlin
+        self.inplane_only = inplane_only
     
     def forward(self, net_output: torch.Tensor, target: torch.Tensor,
                 seg_onehot: torch.Tensor | None = None, loss_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -255,7 +263,9 @@ class SurfaceDiceLoss(nn.Module):
             seg_onehot = seg_onehot[:, 1:]  # Remove background class
         
         # Compute boundary mask
-        boundary = _morphological_boundary_mask(seg_onehot, self.boundary_radius)
+        boundary = _morphological_boundary_mask(
+            seg_onehot, self.boundary_radius, self.inplane_only
+        )
 
         # Honour the ignore label: zero the boundary region on ignored voxels so they
         # contribute nothing to tp/fp/fn below. Without this, ignored voxels are treated
@@ -332,14 +342,16 @@ class DC_and_SurfaceDice_BCE_loss(nn.Module):
         
         # Extract boundary-specific kwargs for SurfaceDice
         boundary_radius = soft_dice_kwargs.pop('boundary_radius', 3)
-        
+        inplane_only = soft_dice_kwargs.pop('inplane_only', False)
+
         # SurfaceDice uses boundary mask internally
         self.dc = SurfaceDiceLoss(
             boundary_radius=boundary_radius,
             smooth=soft_dice_kwargs.get('smooth', 1e-5),
             batch_dice=soft_dice_kwargs.get('batch_dice', True),
             do_bg=soft_dice_kwargs.get('do_bg', False),
-            apply_nonlin=softmax_helper_dim1
+            apply_nonlin=softmax_helper_dim1,
+            inplane_only=inplane_only,
         )
         
         # Normal CE (not boundary weighted)
