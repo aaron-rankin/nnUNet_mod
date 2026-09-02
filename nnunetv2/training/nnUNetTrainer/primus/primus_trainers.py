@@ -9,6 +9,8 @@ except ImportError:
     PrimusV3S = PrimusV3B = PrimusV3M = PrimusV3L = None
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerDA5 import nnUNetTrainerDA5
+from nnunetv2.training.nnUNetTrainer.variants.nnUNetTrainerDA5_NoZFlip_BoundaryIP import _NoZFlipMixin
 from nnunetv2.training.nnUNetTrainer.variants.lr_schedule.nnUNetTrainer_warmup import nnUNetTrainer_warmup
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -272,6 +274,44 @@ class nnUNet_Primus_L_Trainer(AbstractPrimus):
 
 
 class nnUNet_PrimusV2S_Trainer(AbstractPrimus):
+
+    @staticmethod
+    def build_network_architecture(
+        plans_manager: PlansManager,
+        configuration_manager: ConfigurationManager,
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool = True,
+    ) -> nn.Module:
+        # this architecture will crash if the patch size is not divisible by 8!
+        model = PrimusV2S(
+            num_input_channels,
+            num_output_channels,
+            patch_embed_size=(8, 8, 8),
+            input_shape=configuration_manager.patch_size,
+            drop_path_rate=0.2,
+            scale_attn_inner=True,
+            init_values=0.1,
+        )
+        return model
+
+
+class nnUNet_PrimusV2S_Trainer_DA5_NoZFlip(_NoZFlipMixin, nnUNetTrainerDA5, AbstractPrimus):
+    """
+    PrimusV2-S with the baseline's exact augmentation recipe (DA5 + no z-mirroring), for a
+    locked-recipe architecture-verification arm against nnUNetTrainerDA5_NoZFlip /
+    nnUNetResEncUNetMPlans (notes/PUBLICATION_CONTEXT.md Methods §2.3 / §0.2).
+
+    AbstractPrimus's default augmentation is plain nnUNetTrainer's, which includes z-axis
+    (craniocaudal) mirroring -- anatomically invalid for this dataset and explicitly dropped in
+    the CNN baseline recipe (see nnUNetTrainerDA5_NoZFlip_BoundaryIP.py). Mixing in DA5 +
+    _NoZFlipMixin here holds augmentation constant with the baseline so architecture is the only
+    variable that differs. Loss stays the default Dice+CE inherited from AbstractPrimus -- this
+    run tests architecture, not the boundary-aware loss.
+
+    Run with:
+        nnUNetv2_train 601 3d_fullres FOLD -tr nnUNet_PrimusV2S_Trainer_DA5_NoZFlip -p nnUNetResEncUNetMPlans --num_epochs 250
+    """
 
     @staticmethod
     def build_network_architecture(
