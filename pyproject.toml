@@ -85,6 +85,9 @@ nnUNetv2_convert_MSD_dataset = "nnunetv2.dataset_conversion.convert_MSD_dataset:
 dev = [
     "pre-commit"
 ]
+dicom = [
+    "pydicom>=3.0",
+]
 intel_macos = [
     "torch<2.3",
     "numpy<2",
